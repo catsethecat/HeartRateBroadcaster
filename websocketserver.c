@@ -77,22 +77,22 @@ int WebSocketAcceptThread(void* arg) {
 
 int StartWebSocketServer(unsigned short port) {
     if (!CryptAcquireContextA(&hCryptProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
-        fatalError("CryptAcquireContext");
+        return -1;
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return -1;
     SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (serverSocket == -1)
-        return -1;
+        return -2;
     struct sockaddr_in fromAddr;
     fromAddr.sin_family = AF_INET;
     fromAddr.sin_port = htons(port);
     fromAddr.sin_addr.s_addr = INADDR_ANY;
     int addrLen = sizeof(struct sockaddr_in);
     if (bind(serverSocket, (struct sockaddr*)&fromAddr, addrLen) != 0)
-        return -2;
-    if (listen(serverSocket, 10) != 0)
         return -3;
+    if (listen(serverSocket, 10) != 0)
+        return -4;
     CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)WebSocketAcceptThread, (LPVOID)(long long)serverSocket, 0, NULL));
-    printf("WebSocket server started on port %i\n", port);
+    //printf("WebSocket server started on port %i\n", port);
     return 0;
 }
