@@ -9,11 +9,30 @@
 #include <bluetoothleapis.h>
 #include <bthledef.h>
 #include <shellapi.h>
+#include <Dbt.h>
+#include <bluetoothapis.h>
 
 #pragma comment (lib,"Ws2_32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "bluetoothapis.lib")
 #pragma comment (lib, "crypt32.lib")
+
+HANDLE hDev;
+BTH_ADDR btaddr;
+BLUETOOTH_GATT_EVENT_HANDLE hEvent;
+unsigned short port = 2752;
+char statusLine1[64];
+char statusLine2[32];
+
+HCRYPTPROV hCryptProv;
+SOCKET webSocketClients[8];
+int webSocketClientIndex = 0;
+int webSocketClientCount = 0;
+
+void fatalError(char* msg) {
+    MessageBoxA(NULL, msg, "HeartRateBroadcaster", MB_ICONERROR);
+    ExitProcess(0);
+}
 
 // ------------------------------------------------------- CRT stuff ---------------------------------------------------
 
@@ -90,10 +109,10 @@ void free(void* ptr) {
     VirtualFree(ptr, 0, MEM_RELEASE);
 }
 
-int ipow(int base, int exponent) {
+unsigned long long ipow(int base, int exponent) {
     if (!exponent)
         return 1;
-    int res = base;
+    unsigned long long res = base;
     while (exponent-- > 1)
         res *= base;
     return res;
@@ -110,7 +129,7 @@ int str_getint(char* str) {
     digit--;
     int total = 0;
     for (int i = 0; digit >= str; i++, digit--)
-        total += (*digit - '0') * ipow(10, i);
+        total += (*digit - '0') * (int)ipow(10, i);
     return total * sign;
 }
 
@@ -130,8 +149,8 @@ int int_to_str(int num, char* str) {
     char tmp[16] = { 0 };
     int i = 0;
     for (; num > 0; i++) {
-        int b = num % ipow(10, i + 1);
-        tmp[14 - i] = '0' + b / ipow(10, i);
+        int b = num % (int)ipow(10, i + 1);
+        tmp[14 - i] = '0' + b / (int)ipow(10, i);
         num -= b;
     }
     if (str)
@@ -139,18 +158,108 @@ int int_to_str(int num, char* str) {
     return i + negative;
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
+// --------------------------------------------- WebSocket stuff    ----------------------------------------------------
 
-#include "websocketserver.c"
-
-void fatalError(char* msg) {
-    MessageBoxA(NULL, msg, "Fatal error", MB_ICONERROR);
-	ExitProcess(0);
+int WebSocketBroadcast(char* data, unsigned char len) {
+    unsigned char buf[2 + 255];
+    buf[0] = 0x82;
+    buf[1] = len;
+    memcpy(buf + 2, data, len);
+    int i = 0;
+    while (i < webSocketClientIndex) {
+        if (send(webSocketClients[i], buf, 2 + len, 0) > 0) {
+            i++;
+        }
+        else {
+            webSocketClientIndex--;
+            webSocketClients[i] = webSocketClients[webSocketClientIndex];
+        }
+    }
+    return 0;
 }
 
-unsigned short port = 2752;
-char statusLine1[64] = "Device: Disconnected";
-char statusLine2[32] = "WebSocket Port: ";
+int WebSocketReceiveThread(void* arg) {
+    SOCKET clientSocket = (SOCKET)(long long)arg;
+    if (webSocketClientCount == 8)
+        return 0;
+    webSocketClients[webSocketClientIndex] = clientSocket;
+    webSocketClientIndex++, webSocketClientCount++;
+    int_to_str(webSocketClientCount, strstr(statusLine2,",") + 11);
+    char recvBuf[65536];
+    char sendBuf[256];
+    strcpy(sendBuf,
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Accept: ");
+    int res = 0;
+    while ((res = recv(clientSocket, recvBuf, 65536, 0)) > 0) {
+        if (res > 65000) break;
+        recvBuf[res] = 0;
+        if (strcmp(recvBuf, "GET ") != 0) {
+            char* key = strstr(recvBuf, "Sec-WebSocket-Key: ") + 19;
+            if (key == (char*)19) break;
+            char* keyEnd = strstr(key, "\r");
+            if (!keyEnd || keyEnd - key > 32) break;
+            strcpy(keyEnd, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            HCRYPTHASH hHash = 0;
+            CryptCreateHash(hCryptProv, CALG_SHA1, 0, 0, &hHash);
+            CryptHashData(hHash, key, (DWORD)(keyEnd - key + 36), 0);
+            char hashValue[20];
+            DWORD hashValueLen = 20;
+            CryptGetHashParam(hHash, HP_HASHVAL, hashValue, &hashValueLen, 0);
+            CryptDestroyHash(hHash);
+            DWORD base64OutputLen = 100;
+            CryptBinaryToStringA(hashValue, hashValueLen, CRYPT_STRING_BASE64, sendBuf + 97, &base64OutputLen);
+            strcpy(sendBuf + 97 + base64OutputLen, "\r\n");
+            send(clientSocket, sendBuf, 97 + base64OutputLen + 2, 0);
+        }
+        else if ((unsigned char)recvBuf[0] == 0x89) {
+            ((unsigned char*)recvBuf)[0] = 0x8A;
+            send(clientSocket, recvBuf, res, 0);
+        }
+    }
+    closesocket(clientSocket);
+    webSocketClientCount--;
+    int_to_str(webSocketClientCount, strstr(statusLine2, ",") + 11);
+    return 0;
+}
+
+int WebSocketAcceptThread(void* arg) {
+    SOCKET serverSocket = (SOCKET)(long long)arg;
+    while (1) {
+        SOCKET clientSocket = accept(serverSocket, NULL, NULL);
+        if (clientSocket != -1)
+            CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)WebSocketReceiveThread,
+                (LPVOID)(long long)clientSocket, 0, NULL));
+    }
+    return 0;
+}
+
+int StartWebSocketServer(unsigned short port) {
+    if (!CryptAcquireContextA(&hCryptProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        return -1;
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return -1;
+    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (serverSocket == -1)
+        return -2;
+    struct sockaddr_in fromAddr;
+    fromAddr.sin_family = AF_INET;
+    fromAddr.sin_port = htons(port);
+    fromAddr.sin_addr.s_addr = INADDR_ANY;
+    int addrLen = sizeof(struct sockaddr_in);
+    if (bind(serverSocket, (struct sockaddr*)&fromAddr, addrLen) != 0)
+        return -3;
+    if (listen(serverSocket, 10) != 0)
+        return -4;
+    CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)WebSocketAcceptThread, (LPVOID)(long long)serverSocket, 0,
+        NULL));
+    strcpy(statusLine2 + 6 + int_to_str(port, strcpy(statusLine2, "Port: ") + 6), ", Clients: 0");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 void OnCharacteristicValueChanged(BTH_LE_GATT_EVENT_TYPE EventType, PVOID EventOutParameter, PVOID Context) {
     BLUETOOTH_GATT_VALUE_CHANGED_EVENT* event = (BLUETOOTH_GATT_VALUE_CHANGED_EVENT*)EventOutParameter;
@@ -158,25 +267,43 @@ void OnCharacteristicValueChanged(BTH_LE_GATT_EVENT_TYPE EventType, PVOID EventO
 }
 
 int ConnectHeartRateMonitor(void* arg) {
-    // get handle to the first BLE heart rate monitor found
-    GUID classGuid = *(GUID*)"\x0d\x18\x00\x00\x00\x00\x00\x10\x80\x00\x00\x80\x5f\x9b\x34\xfb"; //{0000180D-0000-1000-8000-00805F9B34FB}
+    strcpy(statusLine1, "Device: Connecting...");
+    // get device path of the first BLE heart rate monitor known to the system {0000180D-0000-1000-8000-00805F9B34FB}
+    GUID classGuid = { 0x0000180D, 0x0000, 0x1000, { 0x80, 0x00,  0x00,  0x80,  0x5f,  0x9b,  0x34,  0xfb } };
     HDEVINFO hDevInfo = SetupDiGetClassDevsA(&classGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     SP_DEVICE_INTERFACE_DATA interfaceData = { 0 };
     interfaceData.cbSize = sizeof(interfaceData);
-    BOOL succ = SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &classGuid, 0, &interfaceData);
-    if (!succ)
+    if(!SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &classGuid, 0, &interfaceData))
         fatalError("No devices found. Make sure your device is paired and shows up in Windows settings.");
-    strcpy(statusLine1, "Device: Connecting...");
     char buf[1024];
     PSP_DEVICE_INTERFACE_DETAIL_DATA_A pDetails = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf;
     pDetails->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-    succ = SetupDiGetDeviceInterfaceDetailA(hDevInfo, &interfaceData, pDetails, sizeof(buf), NULL, NULL);
-    if (!succ)
+    if(!SetupDiGetDeviceInterfaceDetailA(hDevInfo, &interfaceData, pDetails, sizeof(buf), NULL, NULL))
         fatalError("failed to get device details");
+    //get bluetooth address ( PKEY_DeviceInterface_Bluetooth_DeviceAddress 2BD67D8B-8BEB-48D5-87E0-6CDA3428040A )
+    //this is jank af there has to be a better way that doesnt involve strings
+    DEVPROPKEY propKey = { { 0x2BD67D8B, 0x8BEB, 0x48D5, { 0x87, 0xe0,  0x6c,  0xda,  0x34,  0x28,  0x04,  0x0a } },
+        1 };
+    char propValue[35];
+    DEVPROPTYPE propType;
+    SP_DEVINFO_DATA infoData = { .cbSize = sizeof(SP_DEVINFO_DATA) };
+    if (!SetupDiEnumDeviceInfo(hDevInfo, 0, &infoData))
+        fatalError("EnumDevInfo");
+    if (!SetupDiGetDevicePropertyW(hDevInfo, &infoData, &propKey, &propType, propValue, sizeof(propValue), NULL, 0))
+        fatalError("GetDevProp");
+    for (int i = 0; ; i++) {
+        if (propValue[i+1] == 0 && propValue[i + 2] == 0) {
+            for (char* c = propValue +i; c >= propValue; c -= 2) {
+                btaddr += (*c < 'a' ? *c - '0' : *c - 'a' + 10) * ipow(16,(i - (int)(c- propValue))/2);
+            }
+            break;
+        }
+    }
     SetupDiDestroyDeviceInfoList(hDevInfo);
-    HANDLE hDev = CreateFileA(pDetails->DevicePath, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hDev == INVALID_HANDLE_VALUE)
-        fatalError("failed to get device handle");
+    // open device handle
+    while ((hDev = CreateFileA(pDetails->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)) == INVALID_HANDLE_VALUE)
+        Sleep(3000);
     // get heart rate service
     BTH_LE_GATT_SERVICE services[16];
     unsigned short numServices = 0;
@@ -192,7 +319,8 @@ int ConnectHeartRateMonitor(void* arg) {
     // get heart rate measurement characteristic
     BTH_LE_GATT_CHARACTERISTIC characteristics[16];
     unsigned short numCharacteristics = 0;
-    res = BluetoothGATTGetCharacteristics(hDev, pHeartRateService, 16, characteristics, &numCharacteristics, BLUETOOTH_GATT_FLAG_NONE);
+    res = BluetoothGATTGetCharacteristics(hDev, pHeartRateService, 16, characteristics, &numCharacteristics, 
+        BLUETOOTH_GATT_FLAG_NONE);
     if (res != S_OK)
         fatalError("failed to get GATT characteristics");
     PBTH_LE_GATT_CHARACTERISTIC pHRMeasurementCharacteristic = 0;
@@ -204,7 +332,8 @@ int ConnectHeartRateMonitor(void* arg) {
     // get descriptor for client characteristic configuration
     BTH_LE_GATT_DESCRIPTOR descriptors[16];
     unsigned short numDescriptors = 0;
-    res = BluetoothGATTGetDescriptors(hDev, pHRMeasurementCharacteristic, 16, descriptors, &numDescriptors, BLUETOOTH_GATT_FLAG_NONE);
+    res = BluetoothGATTGetDescriptors(hDev, pHRMeasurementCharacteristic, 16, descriptors, &numDescriptors, 
+        BLUETOOTH_GATT_FLAG_NONE);
     if (res != S_OK)
         fatalError("failed to get GATT descriptors");
     PBTH_LE_GATT_DESCRIPTOR pConfigDescriptor = 0;
@@ -218,19 +347,16 @@ int ConnectHeartRateMonitor(void* arg) {
     memset(&descriptorValue, 0, sizeof(descriptorValue));
     descriptorValue.DescriptorType = ClientCharacteristicConfiguration;
     descriptorValue.ClientCharacteristicConfiguration.IsSubscribeToNotification = TRUE;
-    while (BluetoothGATTSetDescriptorValue(hDev, pConfigDescriptor, &descriptorValue, BLUETOOTH_GATT_FLAG_NONE) != S_OK) {
-        strcpy(statusLine1, "Device: Retrying descriptor write");
+    while (BluetoothGATTSetDescriptorValue(hDev, pConfigDescriptor, &descriptorValue, BLUETOOTH_GATT_FLAG_NONE) != S_OK)
         Sleep(3000);
-    }
     // register value change event for heart rate measurement characteristic
     BLUETOOTH_GATT_VALUE_CHANGED_EVENT_REGISTRATION eventParams = { 0 };
     eventParams.Characteristics[0] = *pHRMeasurementCharacteristic;
     eventParams.NumCharacteristics = 1;
-    BLUETOOTH_GATT_EVENT_HANDLE hEvent;
-    res = BluetoothGATTRegisterEvent(hDev, CharacteristicValueChangedEvent, &eventParams, (PFNBLUETOOTH_GATT_EVENT_CALLBACK)OnCharacteristicValueChanged, NULL, &hEvent, BLUETOOTH_GATT_FLAG_NONE);
+    res = BluetoothGATTRegisterEvent(hDev, CharacteristicValueChangedEvent, &eventParams, 
+        (PFNBLUETOOTH_GATT_EVENT_CALLBACK)OnCharacteristicValueChanged, NULL, &hEvent, BLUETOOTH_GATT_FLAG_NONE);
     if (res != S_OK)
         fatalError("failed to register value change event");
-    strcpy(statusLine1, "Device: Connected");
     return 0;
 }
 
@@ -248,7 +374,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         break;
-}
+    }
+    case WM_DEVICECHANGE: {
+        if (wParam == DBT_CUSTOMEVENT) {
+            DEV_BROADCAST_HANDLE* hdr = (DEV_BROADCAST_HANDLE*)lParam;
+            //GUID_BLUETOOTH_RADIO_IN_RANGE {EA3B5B82-26EE-450E-B0D8-D26FE30A3869}
+            if (hdr->dbch_devicetype == DBT_DEVTYP_HANDLE && 
+                memcmp(&hdr->dbch_eventguid, "\x82\x5b\x3b\xea\xee\x26\x0e\x45\xb0\xd8\xd2\x6f\xe3\x0a\x38\x69", 16) == 0) {
+                BTH_RADIO_IN_RANGE* rir = (BTH_RADIO_IN_RANGE*)hdr->dbch_data;
+                if (rir->deviceInfo.address == btaddr) {
+                    ULONG diff = rir->deviceInfo.flags ^ rir->previousDeviceFlags;
+                    if (diff & BDIF_LE_CONNECTED) {
+                        if (rir->deviceInfo.flags & BDIF_LE_CONNECTED) {
+                            strncpy(statusLine1, rir->deviceInfo.name, sizeof(statusLine1));
+                        }
+                        else if(hDev) {
+                            BluetoothGATTUnregisterEvent(hEvent, BLUETOOTH_GATT_FLAG_NONE);
+                            CloseHandle(hDev);
+                            hEvent = 0, hDev = 0, btaddr = 0;
+                            CloseHandle(
+                                CreateThread(0, 0, (LPTHREAD_START_ROUTINE)ConnectHeartRateMonitor, 0, 0, NULL));
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
     case WM_COMMAND: {
         PostQuitMessage(0);
         break;
@@ -289,9 +441,9 @@ int WinMainCRTStartup()
             port = str_getint(argv[i + 1]);
     }
 
-    int_to_str(port, statusLine2 + 16);
+    if (FindWindowA("HeartRateBroadcaster", NULL) != NULL)
+        fatalError("Already running");
 
-    //
     HINSTANCE hInstance = GetModuleHandle(0);
     WNDCLASS wc = { 0 };
     wc.style = CS_OWNDC;
@@ -299,7 +451,8 @@ int WinMainCRTStartup()
     wc.hInstance = hInstance;
     wc.lpszClassName = "HeartRateBroadcaster";
     RegisterClass(&wc);
-    HWND hwnd = CreateWindowA("HeartRateBroadcaster", "HeartRateBroadcaster", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    HWND hwnd = CreateWindowA("HeartRateBroadcaster", "HeartRateBroadcaster", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, 
+        hInstance, NULL);
     if (hwnd == NULL)
         fatalError("failed to create window");
 
@@ -315,6 +468,17 @@ int WinMainCRTStartup()
     if (!Shell_NotifyIconA(NIM_ADD, &iconData))
         fatalError("failed to create tray icon");
     Shell_NotifyIconA(NIM_SETVERSION, &iconData);
+
+    BLUETOOTH_FIND_RADIO_PARAMS params;
+    params.dwSize = sizeof(params);
+    HANDLE hRadio = NULL;
+    HBLUETOOTH_RADIO_FIND hFind = BluetoothFindFirstRadio(&params, &hRadio);
+    //BOOL res = BluetoothFindNextRadio(hFind, &hRadio);
+    DEV_BROADCAST_HANDLE filter = { 0 };
+    filter.dbch_size = sizeof(filter);
+    filter.dbch_devicetype = DBT_DEVTYP_HANDLE;
+    filter.dbch_handle = hRadio;
+    HDEVNOTIFY hNotify = RegisterDeviceNotificationA(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     if (StartWebSocketServer(port) != 0)
         fatalError("Failed to start WebSocket server");
