@@ -1,0 +1,40 @@
+<html>
+<head>
+<style>
+body {
+    background: #00FF00;
+}
+.counter {
+    font-family: Calibri;
+    font-weight: 100;
+    font-size: 100px;
+    color: #FFFFFF;
+}
+</style>
+</head>
+<body>
+
+<div id="div_hr" class="counter">?</div>
+
+<script>
+
+function connect() {
+    ws = new WebSocket(`ws://localhost:2752/heartrate`);
+    ws.onmessage = function(msg){
+        new Response(msg.data).arrayBuffer().then(function(arrayBuf){
+            var value = new DataView(arrayBuf);
+            var flags = value.getUint8(0);
+            var heartRate = value.getUint8(1);
+            div_hr.innerHTML = heartRate;
+        });
+    };
+    ws.onclose = function(){
+        setTimeout(connect,3000);
+    };
+}
+connect();
+
+</script>
+
+</body>
+</html>
